@@ -12,6 +12,6 @@ To Do:
 4. Perhaps a better neural network architecture and better optimizers?
 
 How to Use:
-1. Build Open Spiel (clone the repository and "pip install" it) with the Trump environment (`trump.cc` and `trump.h` included).
+1. Build Open Spiel (clone the repository and "pip install" it) with the Trump environment (`trump.cc` and `trump.h`) included. Look up Open Spiel documentary to find out how to do this.
 2. Install other packages: Numpy, JAX, Z3, etc.
 3. Play with the Jupyter notebook provided.

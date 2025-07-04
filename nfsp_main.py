@@ -22,9 +22,9 @@ from tqdm.notebook import tqdm
 import multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 from multiprocessing import Pool
-from cfvfp_worker_proper import run_worker_traversals, get_dir
+from nfsp_worker import run_worker_traversals, get_dir
 
-class DeepCFVFPSolver(policy.Policy):
+class NFSPSolver(policy.Policy):
     def __init__(self,
                  game_name: str,
                  
@@ -56,16 +56,19 @@ class DeepCFVFPSolver(policy.Policy):
                  num_iterations: int = 100,
                  num_traversals_per_player: int = 100,
                  num_iterations_q_per_pi: int = 1,
+                 pi_traversals_multiplier: int = 1,
                 #  branching_rate: float = 0.0,
                 #  branching_depth_limit: int = 0,
+
+                horizon: Optional[int] = None,
 
                  learning_rate: float = 1e-3,
                  
                 #  reinit_q_nets: bool = False,
                  average_weighting_mode: str = 'vanilla',
 
-                 save_dir_buffers: str = "cfvfp_buffers",
-                 save_dir_nets: str = "cfvfp_nets",
+                 save_dir_buffers: str = "nfsp_buffers",
+                 save_dir_nets: str = "nfsp_nets",
                  num_workers = None,
                  seed: int = 42):
         
@@ -73,7 +76,7 @@ class DeepCFVFPSolver(policy.Policy):
         self._uniform = uniform
 
         self._game = pyspiel.load_game(game_name)
-        super(DeepCFVFPSolver, self).__init__(self._game, list(range(self._game.num_players())))
+        super(NFSPSolver, self).__init__(self._game, list(range(self._game.num_players())))
         if self._game.get_type().dynamics == pyspiel.GameType.Dynamics.SIMULTANEOUS:
             raise ValueError('Simultaneous games are not supported.')
         self._num_phases = len(action_transformers)
@@ -120,6 +123,8 @@ class DeepCFVFPSolver(policy.Policy):
         # self.branching_rate = branching_rate
         # self.branching_depth_limit = branching_depth_limit
 
+        self._horizon = horizon if horizon is not None else self._game.max_game_length()
+
         # self._reinit_q_nets = reinit_q_nets
         self._average_weighting_mode = average_weighting_mode
         
@@ -145,6 +150,7 @@ class DeepCFVFPSolver(policy.Policy):
         self.jitted_inference_pi: List[List[Any]] = [[] for _ in range(self._num_phases)]
 
         self._num_iterations_q_per_pi = int(num_iterations_q_per_pi)
+        self._pi_traversals_multiplier = int(pi_traversals_multiplier)
         self._num_iterations = int(num_iterations)
         self._iteration = 1
 
@@ -277,19 +283,24 @@ class DeepCFVFPSolver(policy.Policy):
 
     def solve(self) -> Tuple[List[List[Any]], Dict[str, Dict[int, List[float]]], Dict[str, Dict[int, List[float]]]]:
         # Determine the last complete iteration where all network files exist
-        all_iterations = []
+        all_q_iterations = []
+        all_pi_iterations = []
         for player in range(self._num_players if not self._uniform else 1):
             for phase in range(self._num_phases):
                 q_iters = self._get_saved_iterations(player, phase, 'q')
                 pi_iters = self._get_saved_iterations(player, phase, 'pi')
-                common_iters = q_iters.intersection(pi_iters)
-                all_iterations.append(common_iters)
+                all_q_iterations.append(q_iters)
+                all_pi_iterations.append(pi_iters)
 
-        if all_iterations:
-            common_iterations = set.intersection(*all_iterations)
-            last_complete_iter = max(common_iterations) if common_iterations else 0
-        else:
-            last_complete_iter = 0
+        # Find the last iteration where all q networks exist
+        q_common = set.intersection(*all_q_iterations) if all_q_iterations else set()
+        last_q_iter = max(q_common) if q_common else 0
+
+        # Find the last iteration where all pi networks exist  
+        pi_common = set.intersection(*all_pi_iterations) if all_pi_iterations else set()
+        last_pi_iter = max(pi_common) if pi_common else 0
+
+        last_complete_iter = max(last_q_iter, last_pi_iter)
 
         starting_iter = last_complete_iter + 1 if last_complete_iter > 0 else 1
 
@@ -299,7 +310,7 @@ class DeepCFVFPSolver(policy.Policy):
             for player in range(self._num_players if not self._uniform else 1):
                 for phase in range(self._num_phases):
                     # Load Q-value network state
-                    q_params_path = os.path.join(get_dir(self._save_dir_nets, player, phase, 'q'), f"q_params_iter{last_complete_iter}.msgpack")
+                    q_params_path = os.path.join(get_dir(self._save_dir_nets, player, phase, 'q'), f"q_params_iter{last_q_iter}.msgpack")
                     with open(q_params_path, 'rb') as f:
                         target = {'params': self.params_q[phase][player], 'opt_state': self.opt_states_q[phase][player]}
                         state_dict = flax.serialization.from_bytes(target, f.read())
@@ -307,7 +318,7 @@ class DeepCFVFPSolver(policy.Policy):
                     self.opt_states_q[phase][player] = state_dict['opt_state']
 
                     # Load Average Policy network state
-                    pi_params_path = os.path.join(get_dir(self._save_dir_nets, player, phase, 'pi'), f"pi_params_iter{last_complete_iter}.msgpack")
+                    pi_params_path = os.path.join(get_dir(self._save_dir_nets, player, phase, 'pi'), f"pi_params_iter{last_pi_iter}.msgpack")
                     with open(pi_params_path, 'rb') as f:
                         target = {'params': self.params_pi[phase][player], 'opt_state': self.opt_states_pi[phase][player]}
                         state_dict = flax.serialization.from_bytes(target, f.read())
@@ -322,6 +333,7 @@ class DeepCFVFPSolver(policy.Policy):
         for i in tqdm(range(starting_iter, self._num_iterations + 1), desc="Overall Iteration"):
             self._iteration = i  # Only used for weighting in non-vanilla mode
             train_record_pi = i % self._num_iterations_q_per_pi == 0
+            train_record_q = not train_record_pi if self._pi_traversals_multiplier > 1 else True
 
             revelation_start, revelation_finish = self._revelation_intensity
             if self._revelation_decay_mode == 'exponential':
@@ -337,8 +349,10 @@ class DeepCFVFPSolver(policy.Policy):
                 #         self._reinitialize_q_value_network(player, phase)
                 
                 # Parallel traversals
-                traversals_per_worker = self._num_traversals_per_player // self._num_workers
-                remaining_traversals = self._num_traversals_per_player % self._num_workers
+                actual_traversals = self._num_traversals_per_player * self._pi_traversals_multiplier \
+                                    if train_record_pi else self._num_traversals_per_player
+                traversals_per_worker = actual_traversals // self._num_workers
+                remaining_traversals = actual_traversals % self._num_workers
                 
                 # Prepare worker arguments
                 worker_args = []
@@ -369,6 +383,7 @@ class DeepCFVFPSolver(policy.Policy):
                             'q_models': [self.models_q[phase] for phase in range(self._num_phases)],
                             'pi_models': [self.models_pi[phase] for phase in range(self._num_phases)],
                             'record_pi': train_record_pi,
+                            'record_q': train_record_q,
                             'info_state_tensor_transformers_q': self._info_state_tensor_transformers_q,
                             'info_state_tensor_transformers_pi': self._info_state_tensor_transformers_pi,
                             'action_transformers': self._action_transformers,
@@ -377,6 +392,7 @@ class DeepCFVFPSolver(policy.Policy):
                             'revelation_intensity': revelation_rate,
                             'num_players': self._num_players,
                             'global_num_actions': self._global_num_actions,
+                            'horizon': self._horizon,
                             'iteration': self._iteration,
                             'average_weighting_mode': self._average_weighting_mode,
                             'save_dir_buffers': self._save_dir_buffers,
@@ -421,35 +437,38 @@ class DeepCFVFPSolver(policy.Policy):
                 for phase in tqdm(range(self._num_phases), desc="Phase", leave=False):
                     self._existing_files_filter = existing_files[phase]
 
-                    cur_q_loss = self._learn_q_value_network(player, phase) 
-                    if cur_q_loss is not None:
-                        q_value_losses_by_phase[phase][player].append(float(cur_q_loss))
+                    if train_record_q:
+                        cur_q_loss = self._learn_q_value_network(player, phase) 
+                        if cur_q_loss is not None:
+                            q_value_losses_by_phase[phase][player].append(float(cur_q_loss))
                     if train_record_pi:
                         cur_avg_policy_loss = self._learn_average_policy_network(player, phase)
                         if cur_avg_policy_loss is not None:
                             avg_policy_losses_by_phase[phase][player].append(float(cur_avg_policy_loss))
 
                     # Save networks after each iteration
-                    # Save Q-value networks
-                    q_net_dir = get_dir(self._save_dir_nets, player, phase, "q")
-                    os.makedirs(q_net_dir, exist_ok=True)
-                    q_params_path = os.path.join(q_net_dir, f"q_params_iter{i}.msgpack")
-                    q_state_dict = {
-                        'params': self.params_q[phase][player],
-                        'opt_state': self.opt_states_q[phase][player]
-                    }
-                    with open(q_params_path, 'wb') as f:
-                        f.write(flax.serialization.to_bytes(q_state_dict))
-                    # Save average policy networks
-                    pi_net_dir = get_dir(self._save_dir_nets, player, phase, "pi")
-                    os.makedirs(pi_net_dir, exist_ok=True)
-                    pi_params_path = os.path.join(pi_net_dir, f"pi_params_iter{i}.msgpack")
-                    pi_state_dict = {
-                        'params': self.params_pi[phase][player],
-                        'opt_state': self.opt_states_pi[phase][player]
-                    }
-                    with open(pi_params_path, 'wb') as f:
-                        f.write(flax.serialization.to_bytes(pi_state_dict))
+                    if train_record_q:
+                        # Save Q-value networks
+                        q_net_dir = get_dir(self._save_dir_nets, player, phase, "q")
+                        os.makedirs(q_net_dir, exist_ok=True)
+                        q_params_path = os.path.join(q_net_dir, f"q_params_iter{i}.msgpack")
+                        q_state_dict = {
+                            'params': self.params_q[phase][player],
+                            'opt_state': self.opt_states_q[phase][player]
+                        }
+                        with open(q_params_path, 'wb') as f:
+                            f.write(flax.serialization.to_bytes(q_state_dict))
+                    if train_record_pi:
+                        # Save average policy networks
+                        pi_net_dir = get_dir(self._save_dir_nets, player, phase, "pi")
+                        os.makedirs(pi_net_dir, exist_ok=True)
+                        pi_params_path = os.path.join(pi_net_dir, f"pi_params_iter{i}.msgpack")
+                        pi_state_dict = {
+                            'params': self.params_pi[phase][player],
+                            'opt_state': self.opt_states_pi[phase][player]
+                        }
+                        with open(pi_params_path, 'wb') as f:
+                            f.write(flax.serialization.to_bytes(pi_state_dict))
 
                 # Wait for workers to finish before next iteration
                 if pool is not None:
@@ -521,7 +540,6 @@ class DeepCFVFPSolver(policy.Policy):
     def _learn_q_value_network(self, player: int, phase: int) -> float:
         all_experiences_for_training = self._load_combine_prune_save_experiences(player, phase, "q")
         if not all_experiences_for_training or len(all_experiences_for_training['info_state']) < self._batch_size_q_value[phase]:
-            # print("something's off")
             return None
         
         avg_loss = 0.0

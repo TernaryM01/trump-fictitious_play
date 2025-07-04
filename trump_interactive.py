@@ -236,7 +236,7 @@ def load_latest_params(save_dir, player, phase, net_type="pi"):
         state_dict = flax.serialization.from_bytes(None, f.read())
     return state_dict['params']
 
-def interactive_trump_game(game):
+def interactive_trump_game(game, save_dir_nets="cfvfp_nets"):
     print("=== STARTING INTERACTIVE TRUMP GAME ===")
     state = game.new_initial_state()
     rng = random.Random()  # Used for dealing random hands
@@ -246,7 +246,6 @@ def interactive_trump_game(game):
     num_tricks = num_cards_total // num_players
 
     # Load trained parameters
-    save_dir_nets = "cfvfp_nets_z3-q-only"
     player = 0  # Use player 0's parameters for all players due to symmetry
     params_pi = []
     for phase in range(3):

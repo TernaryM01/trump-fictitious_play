@@ -3,6 +3,14 @@ TrumpGame::TrumpGame(const GameParameters& params)
       // Trump game does not have parameters like HeartsGame does, so constructor is simpler.
 }
 
+double TrumpGame::MinUtility() const {
+  return -26.0 - 7.0;  // Everybody bids 0, you collect all 13 tricks.
+}
+
+double TrumpGame::MaxUtility() const {
+  return 10.0 + 18.0;  // Everybody bids 10, you collect 10 while opponents collect 1 each.
+}
+
 std::vector<int> TrumpGame::InformationStateTensorShape() const {
   // 1. Hand: 52
   // 2. Bid Cards: 4 * 5 = 20
@@ -90,6 +98,66 @@ void EncodeCardToFeatureVector(int card_index, absl::Span<float> feature_vector,
     } else {
        SpielFatalError(absl::StrCat("EncodeCardToFeatureVector: Invalid suit for encoding: ", static_cast<int>(suit)));
     }
+}
+
+std::vector<double> TrumpState::Returns() const {
+  if (!IsTerminal()) {
+    return std::vector<double>(num_players_, 0.0);
+  }
+  std::vector<double> raw_scores(num_players_); // Step 1: Calculate raw scores first
+  for (int p = 0; p < num_players_; ++p) {
+    if (bid_values_[p] == -1) { 
+        SpielFatalError(absl::StrCat("Player ", p, " has an unassigned bid value (-1) at game end."));
+        raw_scores[p] = -999;
+        continue;
+    }
+
+    if (tricks_won_[p] == bid_values_[p]) { 
+      if (bid_values_[p] == 0) { 
+        if (high_low_round_ == HighLowRound::kUndecided) SpielFatalError("Game ended with undecided round type for scoring 0 bid.");
+        raw_scores[p] = (high_low_round_ == HighLowRound::kHigh) ? 5.0 : 7.0;
+      } else { 
+        raw_scores[p] = static_cast<double>(bid_values_[p]);
+      }
+    } else { 
+      int diff_m = std::abs(tricks_won_[p] - bid_values_[p]);
+      double base_penalty_score;
+
+      if (high_low_round_ == HighLowRound::kLow) {
+        base_penalty_score = (tricks_won_[p] < bid_values_[p]) ? (-1.0 * diff_m) : (-2.0 * diff_m);
+      } else if (high_low_round_ == HighLowRound::kHigh) {
+        base_penalty_score = (tricks_won_[p] > bid_values_[p]) ? (-1.0 * diff_m) : (-2.0 * diff_m);
+      } else { 
+          SpielFatalError("Scoring attempted with undecided round type for player a miss.");
+          base_penalty_score = -999; 
+      }
+
+      if (bid_values_[p] == 0) { 
+        SPIEL_CHECK_NE(tricks_won_[p], 0); 
+        if (high_low_round_ == HighLowRound::kLow) {
+            base_penalty_score -= 3.0;
+        } else { 
+            base_penalty_score -= 4.0;
+        }
+      }
+      raw_scores[p] = base_penalty_score;
+    }
+  }
+
+  // Step 2: Calculate zero-sum adjusted scores
+  std::vector<double> adjusted_returns(num_players_);
+  double sum_of_all_raw_scores = 0.0;
+  for (int i = 0; i < num_players_; ++i) {
+    sum_of_all_raw_scores += raw_scores[i];
+  }
+
+  double divider = static_cast<double>(num_players_ - 1.0);
+
+  for (int i = 0; i < num_players_; ++i) {
+    double average_of_others_raw_scores = (sum_of_all_raw_scores - raw_scores[i]) / divider;
+    adjusted_returns[i] = raw_scores[i] - average_of_others_raw_scores;
+  }
+  return adjusted_returns;
 }
 
 void TrumpState::InformationStateTensor(Player player, absl::Span<float> values) const {

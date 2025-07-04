@@ -44,6 +44,7 @@ class GameTraversalWorker:
         self.q_models = args['q_models']
         self.pi_models = args['pi_models']
         self.record_pi = args['record_pi']
+        self.record_q = args['record_q']
         self.infostate_transformers_q = args['info_state_tensor_transformers_q']
         self.infostate_transformers_pi = args['info_state_tensor_transformers_pi']
         self.action_transformers = args['action_transformers']
@@ -52,6 +53,7 @@ class GameTraversalWorker:
         self.revelation_intensity = args['revelation_intensity']
         self.num_players = args['num_players']
         self.global_num_actions = args['global_num_actions']
+        self.horizon = args['horizon']
         self.iteration = args['iteration']
         self.average_weighting_mode = args['average_weighting_mode']
         self.save_dir_buffers = args['save_dir_buffers']
@@ -98,7 +100,7 @@ class GameTraversalWorker:
             q_values_global = action_transformer_fn(q_values_net_output)
             
             masked_q_values = jnp.where(legal_actions_mask_global, q_values_global, jnp.finfo(q_values_global.dtype).min)
-            return jnp.argmax(masked_q_values) # Global action ID
+            return jnp.argmax(masked_q_values), jnp.max(masked_q_values) # Global action ID
         return get_q_br
 
     def _get_jitted_avg_policy(self, pi_model_instance, action_transformer_fn):
@@ -113,9 +115,21 @@ class GameTraversalWorker:
             return jnp.squeeze(avg_policy_probs_global, axis=0)
         return get_policy
 
-    def _traverse_game_tree(self, state: pyspiel.State, traverser_player: int, main: bool = True) -> float:
+    def _traverse_game_tree(self, state: pyspiel.State, traverser_player: int, main: bool = True, recording_queue: Optional[List] = None) -> None:
+        if self.record_q and recording_queue is None:
+            recording_queue = []
+            
         if state.is_terminal():
-            return state.returns()[traverser_player]
+            # Process all remaining states in recording queue using terminal payoff
+            while recording_queue:  # The queue remains `None` if not `self.record_q`.
+                record_info = recording_queue.pop(0)
+                # if self.record_q:  # Guaranteed to be `True`.
+                self.q_value_target_memories_p[record_info['phase']].append({
+                    'info_state': record_info['infostate_q'].astype(jnp.float16),
+                    'action_taken': jnp.array([record_info['best_response']], dtype=jnp.uint8),
+                    'target_q_value': jnp.array([state.returns()[traverser_player] - record_info['cum_reward']], dtype=jnp.float16),
+                })
+
         elif state.is_chance_node():
             chance_outcome_actions, chance_outcome_probs = zip(*state.chance_outcomes())
             chance_outcome_probs = jnp.array(chance_outcome_probs, dtype=jnp.float32)
@@ -127,82 +141,92 @@ class GameTraversalWorker:
             sampled_action = sampled_action.item()
 
             state.apply_action(sampled_action)
-            return self._traverse_game_tree(state, traverser_player, main)
+            self._traverse_game_tree(state, traverser_player, main, recording_queue)
 
-        active_player = state.current_player()
-        
-        if self.revelation_transformer is None or active_player != traverser_player:
-            infostate_raw = jnp.array(state.information_state_tensor(active_player), dtype=jnp.float32)
         else:
-            self.rng_key, rng_subkey = jax.random.split(self.rng_key)
-            infostate_raw = jnp.array(
-                self.revelation_transformer([state.information_state_tensor(p) for p in range(self.num_players)],
-                                            active_player, self.revelation_intensity, rng_subkey),
-                dtype=jnp.float32)
-        
-        phase = self.phase_classifier_fn(infostate_raw)
-        infostate_pi = self.infostate_transformers_pi[phase](infostate_raw)
-        if active_player == traverser_player:
-            infostate_q = self.infostate_transformers_q[phase](infostate_raw)
-        legal_actions_mask = jnp.array(state.legal_actions_mask(active_player), dtype=bool)
-        
-        if active_player == traverser_player:
-            best_response = self.jitted_inference_q[phase](
-                self.params_q[phase],
-                jnp.expand_dims(infostate_q, axis=0),
-                jnp.expand_dims(legal_actions_mask, axis=0)
-            )
+            active_player = state.current_player()
+            
+            if self.revelation_transformer is None or active_player != traverser_player:
+                infostate_raw = jnp.array(state.information_state_tensor(active_player), dtype=jnp.float32)
+            else:
+                self.rng_key, rng_subkey = jax.random.split(self.rng_key)
+                infostate_raw = jnp.array(
+                    self.revelation_transformer([state.information_state_tensor(p) for p in range(self.num_players)],
+                                                active_player, self.revelation_intensity, rng_subkey),
+                    dtype=jnp.float32)
+            
+            phase = self.phase_classifier_fn(infostate_raw)
+            infostate_pi = self.infostate_transformers_pi[phase](infostate_raw)
+            if active_player == traverser_player:
+                infostate_q = self.infostate_transformers_q[phase](infostate_raw)
+            legal_actions_mask = jnp.array(state.legal_actions_mask(active_player), dtype=bool)
+            
+            if active_player == traverser_player:
+                best_response, max_q_value = self.jitted_inference_q[phase](
+                    self.params_q[phase],
+                    jnp.expand_dims(infostate_q, axis=0),
+                    jnp.expand_dims(legal_actions_mask, axis=0)
+                )
 
-            # Record best response for policy training
-            if self.record_pi:
-                data_to_add_pi = {
-                    'info_state': infostate_pi.astype(jnp.float16),
-                    'best_response': best_response.astype(jnp.uint8),
-                    'legal_action_mask': legal_actions_mask
-                }
-                if self.average_weighting_mode != 'vanilla':
-                    data_to_add_pi['iteration'] = jnp.array([self.iteration], dtype=jnp.uint16)
-                self.best_response_memories_p[phase].append(data_to_add_pi)
+                # Record best response for policy training
+                if self.record_pi:
+                    data_to_add_pi = {
+                        'info_state': infostate_pi.astype(jnp.float16),
+                        'best_response': best_response.astype(jnp.uint8),
+                        'legal_action_mask': legal_actions_mask
+                    }
+                    if self.average_weighting_mode != 'vanilla':
+                        data_to_add_pi['iteration'] = jnp.array([self.iteration], dtype=jnp.uint16)
+                    self.best_response_memories_p[phase].append(data_to_add_pi)
 
-            best_response_item = best_response.item()
+                best_response_item = best_response.item()
 
-            # Exploration branching
-            if main:
-                legal_actions = state.legal_actions(active_player)
-                for action in legal_actions:
-                    if action != best_response_item:
-                        achieved_value_exploratory = self._traverse_game_tree(state.child(action), traverser_player, main=False)
-                        # Record Q-value target for exploratory action, but don't return it to parent
-                        self.q_value_target_memories_p[phase].append({
-                            'info_state': infostate_q.astype(jnp.float16),
-                            'action_taken': jnp.array([action], dtype=jnp.uint8),
-                            'target_q_value': jnp.array([achieved_value_exploratory], dtype=jnp.float16),
+                # Exploration branching
+                if main:
+                    legal_actions = state.legal_actions(active_player)
+                    for action in legal_actions:
+                        if action != best_response_item:
+                            self._traverse_game_tree(state.child(action), traverser_player,
+                                                    main=False, recording_queue=recording_queue.copy() if recording_queue is not None else None)
+                            
+                # Main path with best action
+                if self.record_q:
+                    cum_reward = state.returns()[traverser_player]
+
+                    # Add current state info to recording queue
+                    recording_queue.append({
+                        'phase': phase,
+                        'infostate_q': infostate_q,
+                        'best_response': best_response,
+                        'cum_reward': cum_reward,
+                    })
+
+                    if len(recording_queue) > self.horizon:
+                        record_info = recording_queue.pop(0)
+
+                        self.q_value_target_memories_p[record_info['phase']].append({
+                            'info_state': record_info['infostate_q'].astype(jnp.float16),
+                            'action_taken': jnp.array([record_info['best_response']], dtype=jnp.uint8),
+                            'target_q_value': jnp.array([cum_reward - record_info['cum_reward']
+                                                         + max_q_value.item()], dtype=jnp.float16),
                         })
 
-            # Main branch with best action
-            state.apply_action(best_response_item)
-            achieved_value = self._traverse_game_tree(state, traverser_player, main)
-            self.q_value_target_memories_p[phase].append({
-                'info_state': infostate_q.astype(jnp.float16),
-                'action_taken': jnp.array([best_response], dtype=jnp.uint8), 
-                'target_q_value': jnp.array([achieved_value], dtype=jnp.float16),
-            })
-            
-            return achieved_value
-        else: 
-            effective_player = active_player if not self.uniform else 0
-            opponent_avg_policy = self.jitted_inference_pi[phase][effective_player](
-                self.params_pi[phase][effective_player],
-                jnp.expand_dims(infostate_pi, axis=0),
-                jnp.expand_dims(legal_actions_mask, axis=0)
-            )
-            opponent_avg_policy /= jnp.sum(opponent_avg_policy)
-            # Sample an action according to the opponent's average strategy
-            self.rng_key, rng_subkey = jax.random.split(self.rng_key)
-            sampled_action_opp = jax.random.choice(rng_subkey, self.global_num_actions, p=opponent_avg_policy)
+                state.apply_action(best_response_item)
+                self._traverse_game_tree(state, traverser_player, main, recording_queue)
+            else:
+                effective_player = active_player if not self.uniform else 0
+                opponent_avg_policy = self.jitted_inference_pi[phase][effective_player](
+                    self.params_pi[phase][effective_player],
+                    jnp.expand_dims(infostate_pi, axis=0),
+                    jnp.expand_dims(legal_actions_mask, axis=0)
+                )
+                opponent_avg_policy /= jnp.sum(opponent_avg_policy)
+                # Sample an action according to the opponent's average strategy
+                self.rng_key, rng_subkey = jax.random.split(self.rng_key)
+                sampled_action_opp = jax.random.choice(rng_subkey, self.global_num_actions, p=opponent_avg_policy)
 
-            state.apply_action(sampled_action_opp.item())
-            return self._traverse_game_tree(state, traverser_player, main)
+                state.apply_action(sampled_action_opp.item())
+                self._traverse_game_tree(state, traverser_player, main, recording_queue)
 
     def save_in_memory_buffer_to_disk(self, player: int, phase: int, buffer_type: str,
                                       in_memory_buffer: List[Dict[str, jnp.ndarray]]):
@@ -237,9 +261,10 @@ class GameTraversalWorker:
                 break
         
         for phase in range(self.num_phases):
-            self.save_in_memory_buffer_to_disk(
-                self.player, phase, "q", self.q_value_target_memories_p[phase]
-            )
+            if self.record_q:
+                self.save_in_memory_buffer_to_disk(
+                    self.player, phase, "q", self.q_value_target_memories_p[phase]
+                )
             if self.record_pi:
                 self.save_in_memory_buffer_to_disk(
                     self.player, phase, "pi", self.best_response_memories_p[phase]

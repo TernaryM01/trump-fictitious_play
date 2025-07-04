@@ -308,20 +308,18 @@ void EncodeCardToFeatureVector(int card_index, absl::Span<float> feature_vector,
 }
 
 std::vector<double> TrumpState::Returns() const {
-  if (!IsTerminal()) {
-    return std::vector<double>(num_players_, 0.0);
-  }
-  std::vector<double> raw_scores(num_players_); // Step 1: Calculate raw scores first
+  std::vector<double> raw_scores(num_players_);
+
+  // Calculate raw scores based on current state
   for (int p = 0; p < num_players_; ++p) {
-    if (bid_values_[p] == -1) { 
-        SpielFatalError(absl::StrCat("Player ", p, " has an unassigned bid value (-1) at game end."));
-        raw_scores[p] = -999;
+    // if (bid_values_[p] == -1) {
+    if (high_low_round_ == HighLowRound::kUndecided) {
+        raw_scores[p] = 0.0;  // During bidding phase, return neutral scores
         continue;
     }
 
-    if (tricks_won_[p] == bid_values_[p]) { 
-      if (bid_values_[p] == 0) { 
-        if (high_low_round_ == HighLowRound::kUndecided) SpielFatalError("Game ended with undecided round type for scoring 0 bid.");
+    if (tricks_won_[p] == bid_values_[p]) {
+      if (bid_values_[p] == 0) {
         raw_scores[p] = (high_low_round_ == HighLowRound::kHigh) ? 5.0 : 7.0;
       } else { 
         raw_scores[p] = static_cast<double>(bid_values_[p]);
@@ -332,11 +330,8 @@ std::vector<double> TrumpState::Returns() const {
 
       if (high_low_round_ == HighLowRound::kLow) {
         base_penalty_score = (tricks_won_[p] < bid_values_[p]) ? (-1.0 * diff_m) : (-2.0 * diff_m);
-      } else if (high_low_round_ == HighLowRound::kHigh) {
+      } else {  // high_low_round_ == HighLowRound::kHigh
         base_penalty_score = (tricks_won_[p] > bid_values_[p]) ? (-1.0 * diff_m) : (-2.0 * diff_m);
-      } else { 
-          SpielFatalError("Scoring attempted with undecided round type for player a miss.");
-          base_penalty_score = -999; 
       }
 
       if (bid_values_[p] == 0) { 
